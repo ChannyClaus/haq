@@ -85,13 +85,22 @@ impl Validator for HackHelper {}
 
 impl Helper for HackHelper {}
 
+fn history_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".haq_history")
+}
+
 fn main() -> rustyline::Result<()> {
     let helper = HackHelper::new();
     let config = Config::builder()
         .completion_type(CompletionType::List)
+        .max_history_size(1000)?
         .build();
     let mut rl = Editor::with_config(config)?;
     rl.set_helper(Some(helper));
+
+    let hist_path = history_path();
+    let _ = rl.load_history(&hist_path);
 
     println!("haq-repl: Hack (HHVM) REPL (echo mode)");
     println!("Type \\q to exit");
@@ -103,11 +112,13 @@ fn main() -> rustyline::Result<()> {
             ":quit" | "\\q" => break,
             "" => continue,
             _ => {
+                rl.add_history_entry(line)?;
                 rl.helper_mut().unwrap().add_from_line(line);
                 println!("{}", line);
             }
         }
     }
 
+    rl.save_history(&hist_path)?;
     Ok(())
 }
