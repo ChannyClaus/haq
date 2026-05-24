@@ -5,6 +5,8 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
+use std::io::Write;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 struct HackHelper {
@@ -90,6 +92,62 @@ fn history_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join(".haq_history")
 }
 
+fn write_and_run(code: &str) -> Result<(String, String), String> {
+    let mut child = Command::new("docker")
+        .args(["exec", "-i", "hhvm", "sh", "-c", "cat > /tmp/repl.php"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("docker exec (write): {}", e))?;
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(code.as_bytes()).map_err(|e| format!("write code: {}", e))?;
+    }
+    drop(child.stdin.take());
+    child.wait().map_err(|e| format!("wait write: {}", e))?;
+
+    let output = Command::new("docker")
+        .args(["exec", "hhvm", "hhvm", "/tmp/repl.php"])
+        .output()
+        .map_err(|e| format!("docker exec (hhvm): {}", e))?;
+
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn is_decl_keyword(line: &str) -> bool {
+    let keywords = ["function", "class", "interface", "trait", "enum", "type", "newtype"];
+    let first = line.trim().split_whitespace().next().unwrap_or("");
+    keywords.contains(&first)
+}
+
+fn needs_echo(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty()
+        || line.ends_with(';')
+        || line.ends_with('{')
+        || line.ends_with('}')
+        || line.ends_with(',')
+    {
+        return false;
+    }
+    if line.starts_with("echo ") || line.starts_with("print ") || line.starts_with("return ") {
+        return false;
+    }
+    if line.contains('=') && !line.starts_with("== ") && !line.starts_with("!= ") {
+        return false;
+    }
+    let stmt_keywords = [
+        "if", "else", "while", "for", "foreach",
+        "switch", "case", "default", "try", "catch", "finally",
+        "return", "break", "continue", "throw",
+    ];
+    let first = line.split_whitespace().next().unwrap_or("");
+    !stmt_keywords.contains(&first)
+}
+
 fn main() -> rustyline::Result<()> {
     let helper = HackHelper::new();
     let config = Config::builder()
@@ -102,8 +160,11 @@ fn main() -> rustyline::Result<()> {
     let hist_path = history_path();
     let _ = rl.load_history(&hist_path);
 
-    println!("haq-repl: Hack (HHVM) REPL (echo mode)");
+    println!("haq-repl: Hack (HHVM) REPL");
     println!("Type \\q to exit");
+
+    let mut decls = String::new();
+    let mut body = String::new();
 
     loop {
         let line = rl.readline("haq> ")?;
@@ -114,7 +175,50 @@ fn main() -> rustyline::Result<()> {
             _ => {
                 rl.add_history_entry(line)?;
                 rl.helper_mut().unwrap().add_from_line(line);
-                println!("{}", line);
+
+                let next = if is_decl_keyword(line) {
+                    decls.push_str(line);
+                    decls.push('\n');
+                    continue;
+                } else if needs_echo(line) {
+                    format!("  echo {} . \"\\n\";\n", line)
+                } else {
+                    let line = if line.ends_with(';') {
+                        line.to_string()
+                    } else {
+                        format!("{};", line)
+                    };
+                    format!("  {}\n", line)
+                };
+
+                let program = format!(
+                    "<?hh\n{}\n<<__EntryPoint>>\nfunction main(): void {{\n{}\n  echo \"---HAQ---\" . \"\\n\";\n{}\n}}\n",
+                    decls, body, next
+                );
+
+                match write_and_run(&program) {
+                    Ok((stdout, stderr)) => {
+                        let fresh = stdout
+                            .rsplitn(2, "---HAQ---")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if !fresh.is_empty() {
+                            println!("{}", fresh);
+                        }
+                        if !stderr.is_empty() {
+                            eprint!("{}", stderr);
+                        }
+                        std::io::stdout().flush().ok();
+                        std::io::stderr().flush().ok();
+                    }
+                    Err(msg) => {
+                        eprintln!("[hhvm] {}", msg);
+                    }
+                }
+
+                body.push_str(&next);
             }
         }
     }
